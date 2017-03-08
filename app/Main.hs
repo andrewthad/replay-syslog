@@ -88,11 +88,14 @@ main = do
     killAllThreads
 
 countNewlinesUpTo :: Int -> Int -> Word8 -> Maybe Int
-countNewlinesUpTo !total !current !w8
-  | w8 == c2w '\n' = if current < total
-      then Just (current + 1)
-      else Nothing
-  | otherwise = Just current
+countNewlinesUpTo !total !current !w8 =
+  let !newCurrent = if w8 == c2w '\n' then current + 1 else current in
+  if current < total
+    then Just newCurrent
+    else Nothing
+
+-- countNewlinesUpTo :: Int -> Int -> Word8 -> Maybe Int
+-- countNewlinesUpTo !total !current !w8 = Just current
 
 c2w :: Char -> Word8
 c2w = fromIntegral . ord
@@ -139,7 +142,7 @@ scanSplitStream st0 f = STRM.wrap . go1 (Left st0) where
             Right ix -> case BS.splitAt ix bs of
               (!bsA,!bsB) -> do
                 SB.fromStrict bsA
-                go1 (Right bsB) b1
+                go1 (Right bsB) b2
     Right bs1 -> do
       let eix = findIndexScan st0 f bs1
       case eix of
