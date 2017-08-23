@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Main where
 
@@ -14,15 +15,19 @@ import qualified Network.Socket as NS
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Streaming as STRM
+import qualified Streaming.Prelude as STRMP
+import qualified System.Log.FastLogger as FL
 import Control.Monad.Trans.Class
 import Control.Concurrent
 import Control.Monad
+import Control.Exception
 import Streaming (Of(..),Stream)
 import Data.ByteString (ByteString)
 import Data.Word
 import System.IO
 import Data.Char (ord)
 import Foreign
+import StreamLines (lineSplit)
 
 data Settings = Settings
   { settingsBreakpoint :: !Int
@@ -38,7 +43,7 @@ parser = Settings
     [ OA.long "breakpoint"
     , OA.metavar "BREAKPOINT"
     , OA.short 'b'
-    , OA.value 20000
+    , OA.value 100000
     , OA.help "Reestablish TCP connection after this number of messages"
     ])
   <*> OA.option OA.auto (mconcat
@@ -63,29 +68,54 @@ parser = Settings
 
 main :: IO ()
 main = do
+  FL.withFastLogger (FL.LogStdout 4096) program
+  threadDelay 1500000
+
+program :: (FL.LogStr -> IO ()) -> IO ()
+program putLog = do
   s <- OA.execParser (OA.info (OA.helper <*> parser) mempty)
-  c <- BC.newBoundedChan (settingsConnections s * 4)
+  c <- BC.newBoundedChan (settingsConnections s * 2)
+  finished <- newEmptyMVar
   let killAllThreads = replicateM_ (settingsConnections s) (BC.writeChan c Nothing)
-  replicateM_ (settingsConnections s) $ forkIO $ do
+      waitForThreads = replicateM_ (settingsConnections s) (takeMVar finished)
+  forM_ (enumFromTo 1 (settingsConnections s)) $ \i -> forkIO $ do
+    let ixStr = show i
+    putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Initializing worker thread\n"
     let go = do
           m <- BC.readChan c
           case m of
-            Nothing -> return ()
+            Nothing -> putMVar finished ()
             Just lbs -> do
-              addrinfos <- NS.getAddrInfo Nothing (Just (settingsHost s)) (Just (settingsPort s))
-              let serveraddr = head addrinfos
-              sock <- NS.socket (NS.addrFamily serveraddr) NS.Stream NS.defaultProtocol
-              NS.connect sock (NS.addrAddress serveraddr)
-              NSBL.sendAll sock lbs
-              NS.close sock
+              putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Received batch of logs\n"
+              eres <- try $ do
+                addrinfos <- NS.getAddrInfo Nothing (Just (settingsHost s)) (Just (settingsPort s))
+                let serveraddr = head addrinfos
+                sock <- NS.socket (NS.addrFamily serveraddr) NS.Stream NS.defaultProtocol
+                NS.connect sock (NS.addrAddress serveraddr)
+                NSBL.sendAll sock lbs
+                -- Send the newline to ensure that we block until everything
+                -- gets handled downstream.
+                NSBL.send sock "foobar\n"
+                NS.close sock
+              case eres of
+                Left (e :: IOException) -> do
+                  putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Network error, terminating early\n"
+                  putMVar finished ()
+                Right () -> go
     go
-  withFile (settingsFile s) ReadMode $ \h -> do
-    STRM.mapsM_ (\bsStream -> do
-        lbs :> r <- SB.toLazy bsStream
-        BC.writeChan c (Just lbs)
-        return r
-      ) (scanSplitStream 0 (countNewlinesUpTo 10000) (SB.fromHandle h))
-    killAllThreads
+    putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Terminating worker thread\n"
+  let file = settingsFile s
+  h <- case file of
+    "stdin" -> return stdin
+    _ -> openFile file ReadMode
+  let theStream = STRM.mapped SB.toLazy
+        (lineSplit (settingsBreakpoint s) (SB.fromHandle h))
+  STRMP.mapM_ (BC.writeChan c . Just) theStream
+  -- totalBatches <- STRMP.length_ theStream
+  -- putLog $ FL.toLogStr $ "Total batches of logs: " ++ show totalBatches ++ "\n"
+  putLog "Sending thread kill signals\n"
+  killAllThreads
+  waitForThreads
 
 countNewlinesUpTo :: Int -> Int -> Word8 -> Maybe Int
 countNewlinesUpTo !total !current !w8 =
@@ -93,6 +123,13 @@ countNewlinesUpTo !total !current !w8 =
   if current < total
     then Just newCurrent
     else Nothing
+
+-- streamLength :: Stream f m r -> m Int
+-- streamLength = go where
+--   go stream !x = case stream of
+--     Return r -> return x
+--     Effect m -> m >>= \str' -> go str' x
+--     Step f -> go rest $! step (x + 1) a
 
 -- countNewlinesUpTo :: Int -> Int -> Word8 -> Maybe Int
 -- countNewlinesUpTo !total !current !w8 = Just current
@@ -137,12 +174,12 @@ scanSplitStream st0 f = STRM.wrap . go1 (Left st0) where
           let eix = findIndexScan st1 f bs
           case eix of
             Left st2 -> do
-              SB.fromStrict bs
+              SB.fromStrict bs 
               go1 (Left st2) b2
             Right ix -> case BS.splitAt ix bs of
               (!bsA,!bsB) -> do
                 SB.fromStrict bsA
-                go1 (Right bsB) b2
+                return (STRM.wrap (go1 (Right bsB) b2))
     Right bs1 -> do
       let eix = findIndexScan st0 f bs1
       case eix of
@@ -152,7 +189,8 @@ scanSplitStream st0 f = STRM.wrap . go1 (Left st0) where
         Right ix -> case BS.splitAt ix bs1 of
           (!bsA,!bsB) -> do
             SB.fromStrict bsA
-            go1 (Right bsB) b1
+            return (STRM.wrap (go1 (Right bsB) b1))
+            -- go1 (Right bsB) b1
 
 -- | Returns left if you make it all the way to the end.
 findIndexScan :: s -> (s -> Word8 -> Maybe s) -> ByteString -> Either s Int
