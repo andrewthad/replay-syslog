@@ -77,4 +77,43 @@ lineSplit !n0 text0 = loop1 0 text0
                   [] -> loop2 0 cs 
                 else Chunk c (loop2 newCounter cs)
 {-# INLINABLE lineSplit #-}
-{-# SPECIALIZE lineSplit :: Int -> ByteString IO r -> Stream (ByteString IO) IO r #-}
+{-# SPECIALIZE lineSplit :: Int -> ByteString IO () -> Stream (ByteString IO) IO () #-}
+
+-- | This one also counts the total number of lines
+lineSplitCount :: forall m r. Monad m 
+  => Int -- ^ number of lines per group
+  -> ByteString m r -- ^ stream of bytes
+  -> Stream (ByteString m) m (Of Int r)
+lineSplitCount !n0 text0 = loop1 0 0 text0
+  where
+    n :: Int
+    !n = max n0 1
+    loop1 :: Int -> Int -> ByteString m r -> Stream (ByteString m) m (Of Int r)
+    loop1 !total !counter text =
+      case text of
+        Empty r -> Return (total :> r)
+        Go m -> Effect $ liftM (loop1 total counter) m
+        Chunk c cs
+          | B.null c -> loop1 total counter cs
+          | otherwise -> Step (loop2 total counter text)
+    loop2 :: Int -> Int -> ByteString m r -> ByteString m (Stream (ByteString m) m (Of Int r))
+    loop2 !total !counter text =
+      case text of
+        Empty r -> Empty (Return (total :> r))
+        Go m -> Go $ liftM (loop2 total counter) m
+        Chunk c cs ->
+          let !numNewlines = B.count 10 c
+              !newCounter = counter + numNewlines
+           in if newCounter >= n
+                then case drop (n - counter - 1) (B.findIndices (== 10) c) of
+                  i : _ -> 
+                    let !j = i + 1
+                     in Chunk (B.unsafeTake j c) (Empty (loop1 (total + numNewlines) 0 (Chunk (B.unsafeDrop j c) cs)))
+                  -- the empty list cannot happen unless Data.ByteString.count or
+                  -- Data.ByteString.findIndices is misimplemented. The expression
+                  -- that handles this case is only here to satisfy the type
+                  -- checker.
+                  [] -> loop2 0 0 cs 
+                else Chunk c (loop2 (total + numNewlines) newCounter cs)
+{-# INLINABLE lineSplitCount #-}
+{-# SPECIALIZE lineSplitCount :: Int -> ByteString IO () -> Stream (ByteString IO) IO (Of Int ()) #-}

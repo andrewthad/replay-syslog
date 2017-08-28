@@ -16,7 +16,14 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Streaming as STRM
 import qualified Streaming.Prelude as STRMP
+import qualified Streaming.Internal as STRMI
 import qualified System.Log.FastLogger as FL
+import qualified Data.Sequence as SQ
+import qualified System.Clock as CLK
+import qualified Data.ByteString.Lazy as LB
+import Data.Monoid
+import Data.IORef
+import Data.Time
 import Control.Monad.Trans.Class
 import Control.Concurrent
 import Control.Monad
@@ -27,7 +34,7 @@ import Data.Word
 import System.IO
 import Data.Char (ord)
 import Foreign
-import StreamLines (lineSplit)
+import StreamLines (lineSplitCount)
 
 data Settings = Settings
   { settingsBreakpoint :: !Int
@@ -76,6 +83,7 @@ program putLog = do
   s <- OA.execParser (OA.info (OA.helper <*> parser) mempty)
   c <- BC.newBoundedChan (settingsConnections s * 2)
   finished <- newEmptyMVar
+  earlyTermination <- newIORef False
   let killAllThreads = replicateM_ (settingsConnections s) (BC.writeChan c Nothing)
       waitForThreads = replicateM_ (settingsConnections s) (takeMVar finished)
   forM_ (enumFromTo 1 (settingsConnections s)) $ \i -> forkIO $ do
@@ -93,13 +101,11 @@ program putLog = do
                 sock <- NS.socket (NS.addrFamily serveraddr) NS.Stream NS.defaultProtocol
                 NS.connect sock (NS.addrAddress serveraddr)
                 NSBL.sendAll sock lbs
-                -- Send the newline to ensure that we block until everything
-                -- gets handled downstream.
-                NSBL.send sock "foobar\n"
                 NS.close sock
               case eres of
                 Left (e :: IOException) -> do
-                  putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Network error, terminating early\n"
+                  putLog $ FL.toLogStr $ "(" ++ ixStr ++ ") Network error, terminating early: " ++ show e ++ "\n"
+                  writeIORef earlyTermination True
                   putMVar finished ()
                 Right () -> go
     go
@@ -108,14 +114,29 @@ program putLog = do
   h <- case file of
     "stdin" -> return stdin
     _ -> openFile file ReadMode
-  let theStream = STRM.mapped SB.toLazy
-        (lineSplit (settingsBreakpoint s) (SB.fromHandle h))
-  STRMP.mapM_ (BC.writeChan c . Just) theStream
-  -- totalBatches <- STRMP.length_ theStream
-  -- putLog $ FL.toLogStr $ "Total batches of logs: " ++ show totalBatches ++ "\n"
+  let theStream :: Stream (Of LB.ByteString) IO (Of Int ())
+      theStream = STRM.mapped SB.toLazy
+        (lineSplitCount (settingsBreakpoint s) (SB.fromHandle h))
+  start <- getCurrentTime
+  totalLines :> () <- id
+    $ STRMP.mapM_ (\timeSeq -> maybe 
+        (return ())
+        (\i -> putLog ("Documents per second: " <> FL.toLogStr (show i) <> "\n"))
+        (diffSequence (settingsBreakpoint s) timeSeq)
+      )
+    $ STRMP.slidingWindow 20
+    $ STRMP.mapM (\x -> BC.writeChan c (Just x) >> fmap CLK.toNanoSecs (CLK.getTime CLK.Monotonic))
+    $ takeWhileDefM (0 :> ()) (\_ -> fmap not (readIORef earlyTermination))
+    $ theStream
   putLog "Sending thread kill signals\n"
   killAllThreads
   waitForThreads
+  end <- getCurrentTime
+  let elapsed = round (diffUTCTime end start) :: Int
+      eps = div totalLines (max elapsed 1)
+  putStrLn $ "Total number of logs: " ++ show totalLines
+  putStrLn $ "Seconds elapsed: " ++ show elapsed
+  putStrLn $ "Events per second: " ++ show eps
 
 countNewlinesUpTo :: Int -> Int -> Word8 -> Maybe Int
 countNewlinesUpTo !total !current !w8 =
@@ -123,6 +144,16 @@ countNewlinesUpTo !total !current !w8 =
   if current < total
     then Just newCurrent
     else Nothing
+
+diffSequence :: 
+     Int -- ^ Number of elements in each batch
+  -> SQ.Seq Integer -- ^ series of timestamps in nanoseconds
+  -> Maybe Integer -- ^ Elements per second
+diffSequence batchSize timeSeq = case SQ.viewl timeSeq of
+  SQ.EmptyL -> Nothing
+  earliest SQ.:< timeSeq' -> case SQ.viewr timeSeq' of
+    SQ.EmptyR -> Nothing
+    _ SQ.:> latest -> Just (div (1000000000 * fromIntegral (SQ.length timeSeq) * fromIntegral batchSize) (latest - earliest))
 
 -- streamLength :: Stream f m r -> m Int
 -- streamLength = go where
@@ -205,5 +236,14 @@ findIndexScan st0 f (BSI.PS x s l) = BSI.accursedUnutterablePerformIO $ withFore
           Just st' -> go (ptr `plusPtr` 1) (n+1) st'
 {-# INLINE findIndexScan #-}
 
+
+takeWhileDefM :: Monad m => r -> (a -> m Bool) -> Stream (Of a) m r -> Stream (Of a) m r
+takeWhileDefM val pred = loop where
+  loop str = case str of
+    STRMI.Step (a :> as) -> do
+      b <- lift (pred a)
+      if b then STRMI.Step (a :> loop as) else STRMI.Return val
+    STRMI.Effect m -> STRMI.Effect (liftM loop m)
+    STRMI.Return r -> STRMI.Return r
 
 
